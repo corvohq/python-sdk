@@ -33,6 +33,10 @@ class ErrNotLeader(Exception):
 # RPC Client
 # ---------------------------------------------------------------------------
 
+SDK_NAME = "corvo-python"
+SDK_VERSION = "0.2.0"
+
+
 class RpcClient:
     """Typed gRPC client for the Corvo WorkerService."""
 
@@ -71,6 +75,8 @@ class RpcClient:
 
     def _metadata(self) -> List[Tuple[str, str]]:
         md: List[Tuple[str, str]] = []
+        md.append(("x-corvo-client-name", SDK_NAME))
+        md.append(("x-corvo-client-version", SDK_VERSION))
         for k, v in self._headers.items():
             md.append((k, v))
         if self._api_key:
