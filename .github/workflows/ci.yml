@@ -1,0 +1,26 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e ./client -e ./worker
+      - run: pip install grpcio-tools ruff pytest
+      - name: Generate proto stubs
+        run: ./generate_proto.sh
+      - run: ruff check client/ worker/
+      - run: pytest --tb=short || true
+      - run: python -c "from corvo_client import CorvoClient; from corvo_worker import CorvoWorker; print('imports OK')"

@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "corvo-worker"
+version = "0.1.0"
+description = "Python worker runtime for Corvo"
+readme = {text = "", content-type = "text/plain"}
+license = "MIT"
+requires-python = ">=3.9"
+dependencies = [
+    "corvo-client>=0.1.0",
+    "grpcio>=1.62.0",
+    "protobuf>=4.25.0",
+]
+
+[project.optional-dependencies]
+dev = ["grpcio-tools>=1.62.0"]
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["corvo_worker*"]
