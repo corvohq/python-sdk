@@ -158,6 +158,9 @@ class CorvoClient:
     def delete_job(self, job_id: str) -> Dict[str, Any]:
         return self._request("DELETE", f"/api/v1/jobs/{job_id}")
 
+    def get_server_info(self) -> Dict[str, Any]:
+        return self._request("GET", "/api/v1/info")
+
     def bulk_get_jobs(self, ids: List[str]) -> List[Dict[str, Any]]:
         result = self._request("POST", "/api/v1/jobs/bulk-get", {"job_ids": ids})
         return result.get("jobs", [])
