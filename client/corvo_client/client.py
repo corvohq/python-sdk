@@ -158,6 +158,69 @@ class CorvoClient:
     def delete_job(self, job_id: str) -> Dict[str, Any]:
         return self._request("DELETE", f"/api/v1/jobs/{job_id}")
 
+    def bulk_get_jobs(self, ids: List[str]) -> List[Dict[str, Any]]:
+        result = self._request("POST", "/api/v1/jobs/bulk-get", {"job_ids": ids})
+        return result.get("jobs", [])
+
+    def subscribe(
+        self,
+        queues: Optional[List[str]] = None,
+        job_ids: Optional[List[str]] = None,
+        types: Optional[List[str]] = None,
+        last_event_id: Optional[int] = None,
+    ):
+        """Stream lifecycle events via SSE. Yields dicts for each event."""
+        import json as _json
+
+        params: Dict[str, str] = {}
+        if queues:
+            params["queues"] = ",".join(queues)
+        if job_ids:
+            params["job_ids"] = ",".join(job_ids)
+        if types:
+            params["types"] = ",".join(types)
+        if last_event_id is not None:
+            params["last_event_id"] = str(last_event_id)
+
+        url = self.base_url + "/api/v1/events"
+        headers: Dict[str, str] = {}
+        headers.update(self.headers)
+        if self.api_key:
+            headers[self.api_key_header or "X-API-Key"] = self.api_key
+        token = self.bearer_token
+        if self.token_provider is not None:
+            token = self.token_provider()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        resp = self.session.get(url, params=params, headers=headers, stream=True, timeout=None)
+        if not resp.ok:
+            raise CorvoError(f"SSE stream failed: HTTP {resp.status_code}")
+
+        event_type = ""
+        event_id = ""
+        data_lines: List[str] = []
+
+        for line in resp.iter_lines(decode_unicode=True):
+            if line is None:
+                continue
+            if line.startswith("event: "):
+                event_type = line[7:]
+            elif line.startswith("id: "):
+                event_id = line[4:]
+            elif line.startswith("data: "):
+                data_lines.append(line[6:])
+            elif line == "":
+                if data_lines:
+                    try:
+                        data = _json.loads("\n".join(data_lines))
+                        yield {"type": event_type, "id": event_id, "data": data}
+                    except ValueError:
+                        pass
+                event_type = ""
+                event_id = ""
+                data_lines = []
+
     def _request(self, method: str, path: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = self.base_url + path
         headers = {"Content-Type": "application/json"}
