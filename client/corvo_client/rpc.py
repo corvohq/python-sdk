@@ -14,7 +14,7 @@ from .gen.corvo.v1 import worker_pb2, worker_pb2_grpc
 
 
 SDK_NAME = "corvo-python"
-SDK_VERSION = "0.2.0"
+SDK_VERSION = "0.3.0"
 
 
 class ClientRpc:
