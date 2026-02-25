@@ -46,6 +46,7 @@ class EnqueueOptions:
     retry_base_delay: Optional[str] = None
     retry_max_delay: Optional[str] = None
     chain: Optional[ChainConfig] = None
+    batch_id: Optional[str] = None
 
 
 class CorvoClient:
@@ -157,6 +158,15 @@ class CorvoClient:
 
     def delete_job(self, job_id: str) -> Dict[str, Any]:
         return self._request("DELETE", f"/api/v1/jobs/{job_id}")
+
+    def create_batch(self, callback_queue: str, callback_payload: Any = None) -> Dict[str, Any]:
+        body: Dict[str, Any] = {"callback_queue": callback_queue}
+        if callback_payload is not None:
+            body["callback_payload"] = callback_payload
+        return self._request("POST", "/api/v1/batch", body)
+
+    def seal_batch(self, batch_id: str) -> Dict[str, Any]:
+        return self._request("POST", f"/api/v1/batch/{batch_id}/seal")
 
     def get_server_info(self) -> Dict[str, Any]:
         return self._request("GET", "/api/v1/info")
