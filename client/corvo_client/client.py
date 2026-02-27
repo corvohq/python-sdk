@@ -49,6 +49,22 @@ class EnqueueOptions:
     batch_id: Optional[str] = None
 
 
+@dataclass
+class SearchFilter:
+    queue: Optional[str] = None
+    state: Optional[List[str]] = None
+    priority: Optional[str] = None
+    tags: Optional[Dict[str, str]] = None
+    payload_contains: Optional[str] = None
+    error_contains: Optional[str] = None
+    chain_id: Optional[str] = None
+    batch_id: Optional[str] = None
+    sort: Optional[str] = None
+    order: Optional[str] = None
+    limit: Optional[int] = None
+    cursor: Optional[str] = None
+
+
 class CorvoClient:
     def __init__(
         self,
