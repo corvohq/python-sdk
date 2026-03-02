@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import random
+import time as _time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -76,6 +78,8 @@ class CorvoClient:
         api_key_header: str = "X-API-Key",
         token_provider: Optional[Callable[[], str]] = None,
         use_rpc: bool = False,
+        max_retries: int = 3,
+        retry_delay: float = 1.0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
@@ -87,6 +91,8 @@ class CorvoClient:
         self.token_provider = token_provider
         self._use_rpc = use_rpc
         self._rpc_client: Optional[Any] = None
+        self._max_retries = max_retries
+        self._retry_delay = retry_delay
 
     def _get_rpc(self) -> Any:
         if self._rpc_client is None:
@@ -261,21 +267,46 @@ class CorvoClient:
             token = self.token_provider()
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        resp = self.session.request(method=method, url=url, json=body, timeout=self.timeout, headers=headers)
-        if not resp.ok:
-            msg = f"HTTP {resp.status_code}"
-            code = ""
+
+        attempts = self._max_retries if self._max_retries > 0 else 1
+        last_err: Optional[Exception] = None
+
+        for attempt in range(attempts):
+            if attempt > 0:
+                jitter = 0.75 + random.random() * 0.5  # 0.75x–1.25x
+                _time.sleep(self._retry_delay * jitter)
+
             try:
-                data = resp.json()
-                if isinstance(data, dict):
-                    if data.get("error"):
-                        msg = str(data["error"])
-                    code = str(data.get("code", ""))
-            except Exception:
-                pass
-            if code == "PAYLOAD_TOO_LARGE":
-                raise PayloadTooLargeError(msg)
-            raise CorvoError(msg)
-        if resp.status_code == 204 or not resp.content:
-            return {}
-        return resp.json()
+                resp = self.session.request(method=method, url=url, json=body, timeout=self.timeout, headers=headers)
+            except (requests.ConnectionError, requests.Timeout) as exc:
+                last_err = CorvoError(str(exc))
+                if attempt < attempts - 1:
+                    continue
+                raise last_err from exc
+
+            if resp.status_code in (502, 503, 429):
+                last_err = CorvoError(f"HTTP {resp.status_code}")
+                if attempt < attempts - 1:
+                    continue
+                raise last_err
+
+            if not resp.ok:
+                msg = f"HTTP {resp.status_code}"
+                code = ""
+                try:
+                    data = resp.json()
+                    if isinstance(data, dict):
+                        if data.get("error"):
+                            msg = str(data["error"])
+                        code = str(data.get("code", ""))
+                except Exception:
+                    pass
+                if code == "PAYLOAD_TOO_LARGE":
+                    raise PayloadTooLargeError(msg)
+                raise CorvoError(msg)
+
+            if resp.status_code == 204 or not resp.content:
+                return {}
+            return resp.json()
+
+        raise last_err or CorvoError("request failed")
