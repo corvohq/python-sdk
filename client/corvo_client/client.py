@@ -112,11 +112,13 @@ class CorvoClient:
             return self._get_rpc().enqueue(queue, payload)
         body = {"queue": queue, "payload": payload}
         body.update(kwargs)
-        return self._request("POST", "/api/v1/enqueue", body)
+        result = self._request("POST", "/api/v1/enqueue", body)
+        return self._extract_enqueue_job_id(result)
 
     def enqueue_with(self, opts: EnqueueOptions) -> Dict[str, Any]:
         body = {k: v for k, v in asdict(opts).items() if v is not None}
-        return self._request("POST", "/api/v1/enqueue", body)
+        result = self._request("POST", "/api/v1/enqueue", body)
+        return self._extract_enqueue_job_id(result)
 
     def get_job(self, job_id: str) -> Dict[str, Any]:
         return self._request("GET", f"/api/v1/jobs/{job_id}")
@@ -255,6 +257,15 @@ class CorvoClient:
                 event_type = ""
                 event_id = ""
                 data_lines = []
+
+    @staticmethod
+    def _extract_enqueue_job_id(result: Dict[str, Any]) -> Dict[str, Any]:
+        """Add convenience job_id from nested job object or unique_job_id."""
+        if "job" in result and result["job"]:
+            result["job_id"] = result["job"]["id"]
+        elif "unique_job_id" in result:
+            result["job_id"] = result["unique_job_id"]
+        return result
 
     def _request(self, method: str, path: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = self.base_url + path
