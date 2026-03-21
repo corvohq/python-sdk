@@ -1,3 +1,5 @@
-from .client import CorvoClient, EnqueueOptions, PayloadTooLargeError
+from .client import CorvoClient, EnqueueOptions, PayloadTooLargeError, UniqueConflictError
+from .conn import Conn
+from .pool import Client
 
-__all__ = ["CorvoClient", "EnqueueOptions", "PayloadTooLargeError"]
+__all__ = ["Client", "Conn", "CorvoClient", "EnqueueOptions", "PayloadTooLargeError", "UniqueConflictError"]

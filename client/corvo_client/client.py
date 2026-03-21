@@ -20,6 +20,16 @@ class PayloadTooLargeError(CorvoError):
     pass
 
 
+class UniqueConflictError(CorvoError):
+    """Raised when enqueuing a job with a unique key that already exists (HTTP 409).
+
+    The unique_job_id attribute contains the ID of the existing job.
+    """
+    def __init__(self, message: str, unique_job_id: str = "") -> None:
+        super().__init__(message)
+        self.unique_job_id = unique_job_id
+
+
 @dataclass
 class ChainStep:
     queue: str
@@ -77,7 +87,6 @@ class CorvoClient:
         api_key: str = "",
         api_key_header: str = "X-API-Key",
         token_provider: Optional[Callable[[], str]] = None,
-        use_rpc: bool = False,
         max_retries: int = 3,
         retry_delay: float = 1.0,
     ) -> None:
@@ -89,27 +98,10 @@ class CorvoClient:
         self.api_key = api_key
         self.api_key_header = api_key_header
         self.token_provider = token_provider
-        self._use_rpc = use_rpc
-        self._rpc_client: Optional[Any] = None
         self._max_retries = max_retries
         self._retry_delay = retry_delay
 
-    def _get_rpc(self) -> Any:
-        if self._rpc_client is None:
-            from .rpc import ClientRpc
-            self._rpc_client = ClientRpc(
-                self.base_url,
-                bearer_token=self.bearer_token,
-                api_key=self.api_key,
-                api_key_header=self.api_key_header,
-                headers=dict(self.headers) if self.headers else None,
-                token_provider=self.token_provider,
-            )
-        return self._rpc_client
-
     def enqueue(self, queue: str, payload: Any, **kwargs: Any) -> Dict[str, Any]:
-        if self._use_rpc and not kwargs:
-            return self._get_rpc().enqueue(queue, payload)
         body = {"queue": queue, "payload": payload}
         body.update(kwargs)
         result = self._request("POST", "/api/v1/enqueue", body)
@@ -146,13 +138,9 @@ class CorvoClient:
         return out
 
     def fail(self, job_id: str, error: str, backtrace: str = "") -> Dict[str, Any]:
-        if self._use_rpc:
-            return self._get_rpc().fail(job_id, error, backtrace)
         return self._request("POST", f"/api/v1/fail/{job_id}", {"error": error, "backtrace": backtrace})
 
     def heartbeat(self, jobs: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
-        if self._use_rpc:
-            return self._get_rpc().heartbeat(jobs)
         return self._request("POST", "/api/v1/heartbeat", {"jobs": jobs})
 
     def fetch_batch(self, queues: list[str], worker_id: str, hostname: str = "corvo-worker", timeout: int = 30, count: int = 10) -> Dict[str, Any]:
@@ -170,9 +158,6 @@ class CorvoClient:
         if batch is not None:
             body["batch"] = batch
         return self._request("POST", "/api/v1/enqueue/batch", body)
-
-    def retry_job(self, job_id: str) -> Dict[str, Any]:
-        return self._request("POST", f"/api/v1/jobs/{job_id}/retry")
 
     def cancel_job(self, job_id: str) -> Dict[str, Any]:
         return self._request("POST", f"/api/v1/jobs/{job_id}/cancel")
@@ -314,6 +299,9 @@ class CorvoClient:
                     pass
                 if code == "PAYLOAD_TOO_LARGE":
                     raise PayloadTooLargeError(msg)
+                if resp.status_code == 409:
+                    uid = data.get("unique_job_id", "") if isinstance(data, dict) else ""
+                    raise UniqueConflictError(msg, uid)
                 raise CorvoError(msg)
 
             if resp.status_code == 204 or not resp.content:
