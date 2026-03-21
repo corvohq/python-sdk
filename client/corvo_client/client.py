@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import random
 import time as _time
 from dataclasses import asdict, dataclass, field
@@ -140,8 +141,18 @@ class CorvoClient:
     def fail(self, job_id: str, error: str, backtrace: str = "") -> Dict[str, Any]:
         return self._request("POST", f"/api/v1/fail/{job_id}", {"error": error, "backtrace": backtrace})
 
-    def heartbeat(self, jobs: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
-        return self._request("POST", "/api/v1/heartbeat", {"jobs": jobs})
+    def heartbeat(self, jobs: Dict[str, Dict[str, Any]], worker_id: str = "corvo-worker") -> Dict[str, Any]:
+        job_list = []
+        for job_id, updates in jobs.items():
+            entry: Dict[str, Any] = {"job_id": job_id}
+            if "progress" in updates:
+                p = updates["progress"]
+                entry["progress"] = json.dumps(p) if not isinstance(p, str) else p
+            if "checkpoint" in updates:
+                c = updates["checkpoint"]
+                entry["checkpoint"] = json.dumps(c) if not isinstance(c, str) else c
+            job_list.append(entry)
+        return self._request("POST", "/api/v1/heartbeat", {"worker_id": worker_id, "jobs": job_list})
 
     def fetch_batch(self, queues: list[str], worker_id: str, hostname: str = "corvo-worker", timeout: int = 30, count: int = 10) -> Dict[str, Any]:
         return self._request(
