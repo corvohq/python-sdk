@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import socket
 import struct
-import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -194,12 +193,11 @@ class Conn:
     def enqueue_batch(self, jobs: list[EnqueueJob]) -> int:
         """Enqueue a batch of jobs. Returns the number of jobs enqueued."""
         count = len(jobs)
-        now_ns = time.time_ns()
 
         buf = bytearray()
 
-        # [count:u16][now_ns:u64]
-        buf.extend(struct.pack("<HQ", count, now_ns))
+        # [count:u16]
+        buf.extend(struct.pack("<H", count))
 
         for job in jobs:
             queue_b = job.queue.encode()
@@ -282,13 +280,12 @@ class Conn:
         ``credits`` controls how many jobs the server is allowed to push before
         the client must replenish by calling subscribe() again.
         """
-        now_ns = time.time_ns()
         worker_b = worker_id.encode()
 
         buf = bytearray()
 
-        # [now_ns:u64][credits:u16][lease_ms:u32][worker_id:lenPrefixed][queue_count:u8]
-        buf.extend(struct.pack("<QHI", now_ns, credits, lease_ms))
+        # [credits:u16][lease_ms:u32][worker_id:lenPrefixed][queue_count:u8]
+        buf.extend(struct.pack("<HI", credits, lease_ms))
         _append_len_prefixed(buf, worker_b)
         buf.append(len(queues))
 
@@ -336,12 +333,10 @@ class Conn:
 
     def ack_batch(self, acks: list[AckJob]) -> None:
         """Acknowledge a batch of jobs."""
-        now_ns = time.time_ns()
-
         buf = bytearray()
 
-        # [now_ns:u64][count:u16]
-        buf.extend(struct.pack("<QH", now_ns, len(acks)))
+        # [count:u16]
+        buf.extend(struct.pack("<H", len(acks)))
 
         for ack in acks:
             # [job_id:lenPrefixed][queue:lenPrefixed][ack_status:u8][flags:u8]
@@ -374,12 +369,10 @@ class Conn:
 
     def fail_batch(self, jobs: list[FailJob]) -> None:
         """Fail a batch of jobs with error messages."""
-        now_ns = time.time_ns()
-
         buf = bytearray()
 
-        # [now_ns:u64][count:u16]
-        buf.extend(struct.pack("<QH", now_ns, len(jobs)))
+        # [count:u16]
+        buf.extend(struct.pack("<H", len(jobs)))
 
         # per job: [id:lenPrefixed][queue:lenPrefixed][error:lenPrefixed][backtrace:lenPrefixed]
         for job in jobs:

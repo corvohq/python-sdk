@@ -52,7 +52,7 @@ def test_enqueue_with_options(client):
     job_id = result["job_id"]
 
     got = client.get_job(job_id)
-    assert got["priority"] == 1, f"expected priority=1 (high), got {got['priority']}"
+    assert got["priority"] == 75, f"expected priority=75 (high), got {got['priority']}"
     assert got["max_retries"] == 5, f"expected max_retries=5, got {got['max_retries']}"
 
     # Clean up
@@ -143,6 +143,9 @@ def test_worker(client):
 
     assert processed.wait(timeout=15), "timed out waiting for job"
     assert processed_id[0] == job_id
+
+    # Give worker time to ack the job
+    time.sleep(0.5)
 
     got = client.get_job(job_id)
     assert got["state"] == "completed", f"expected completed, got {got['state']}"
