@@ -168,7 +168,7 @@ class CorvoClient:
         body: Dict[str, Any] = {"jobs": jobs}
         if batch is not None:
             body["batch"] = batch
-        return self._request("POST", "/api/v1/enqueue/batch", body)
+        return self._request("POST", "/api/v1/enqueue", body)
 
     def cancel_job(self, job_id: str) -> Dict[str, Any]:
         return self._request("POST", f"/api/v1/jobs/{job_id}/cancel")
