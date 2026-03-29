@@ -37,6 +37,12 @@ MSG_HEARTBEAT_RESP = 0x86
 MSG_FAIL_BATCH_RESP = 0x87
 MSG_ERROR = 0xFF
 
+MSG_CANCEL_SIGNAL = 0x08  # server -> client push
+
+# Bulk action request/response
+MSG_BULK_ACTION = 0x14
+MSG_BULK_ACTION_RESP = 0x94
+
 DEFAULT_LEASE_MS = 30_000
 
 # -- Backoff constants --------------------------------------------------------
@@ -423,6 +429,130 @@ class Conn:
     def ping(self) -> None:
         """Send a ping and wait for pong. Useful for connection health checks."""
         self._send_recv(MSG_PING, MSG_PONG, b"")
+
+    def read_frame(self) -> dict:
+        """Read the next frame from the server, dispatching by message type.
+
+        Use in a message loop after subscribe() to handle interleaved
+        FETCH_RESP, ACK_RESP, FAIL_RESP, and CANCEL_SIGNAL frames.
+
+        Returns a dict with 'type' key and type-specific data:
+          {'type': 'fetch_resp', 'jobs': [...]}
+          {'type': 'ack_resp', 'affected': int}
+          {'type': 'fail_resp', 'affected': int}
+          {'type': 'cancel_signal', 'job_ids': [...]}
+          {'type': 'pong'}
+          {'type': 'error', 'message': str}
+        """
+        sock = self._ensure_connected()
+
+        resp_hdr = self._recv_exact(sock, FRAME_HEADER_SIZE)
+        resp_type, resp_id, resp_len = struct.unpack(FRAME_HEADER_FMT, resp_hdr)
+
+        if resp_len > 0:
+            if resp_len > len(self._recv_buf):
+                self._recv_buf = bytearray(resp_len)
+            self._recv_exact_into(sock, self._recv_buf, resp_len)
+            resp_payload = memoryview(self._recv_buf)[:resp_len]
+        else:
+            resp_payload = memoryview(self._recv_buf)[:0]
+
+        if resp_type == MSG_FETCH_BATCH_RESP:
+            return {"type": "fetch_resp", "jobs": self._decode_fetch_response(resp_payload)}
+
+        if resp_type == MSG_ACK_BATCH_RESP:
+            affected = struct.unpack_from("<H", resp_payload)[0] if len(resp_payload) >= 2 else 0
+            return {"type": "ack_resp", "affected": affected}
+
+        if resp_type == MSG_FAIL_BATCH_RESP:
+            affected = struct.unpack_from("<H", resp_payload)[0] if len(resp_payload) >= 2 else 0
+            return {"type": "fail_resp", "affected": affected}
+
+        if resp_type == MSG_CANCEL_SIGNAL:
+            job_ids = []
+            if len(resp_payload) >= 2:
+                count = struct.unpack_from("<H", resp_payload)[0]
+                pos = 2
+                for _ in range(count):
+                    jid, pos = _read_len_prefixed(resp_payload, pos)
+                    job_ids.append(jid.decode())
+            return {"type": "cancel_signal", "job_ids": job_ids}
+
+        if resp_type == MSG_PONG:
+            return {"type": "pong"}
+
+        if resp_type == MSG_ERROR:
+            err_msg = bytes(resp_payload).decode("utf-8", errors="replace")
+            return {"type": "error", "message": err_msg}
+
+        raise RpcError(f"unexpected message type: 0x{resp_type:02x}")
+
+    def send_ack(self, acks: list[AckJob]) -> None:
+        """Send ack batch without waiting for response (fire-and-forget).
+
+        The response will arrive via read_frame() as {'type': 'ack_resp'}.
+        """
+        buf = bytearray()
+        buf.extend(struct.pack("<H", len(acks)))
+
+        for ack in acks:
+            _append_len_prefixed(buf, ack.job_id.encode())
+            _append_len_prefixed(buf, ack.queue.encode())
+            buf.append(ack.ack_status)
+
+            flags = 0
+            if ack.result:
+                flags |= 0x01
+            if ack.checkpoint:
+                flags |= 0x02
+            if ack.hold_reason:
+                flags |= 0x04
+            buf.append(flags)
+
+            if flags & 0x01:
+                _append_len_prefixed(buf, ack.result.encode())
+            if flags & 0x02:
+                _append_len_prefixed(buf, ack.checkpoint.encode())
+            if flags & 0x04:
+                _append_len_prefixed(buf, ack.hold_reason.encode())
+
+        self._send_only(MSG_ACK_BATCH, bytes(buf))
+
+    def send_fail(self, jobs: list[FailJob]) -> None:
+        """Send fail batch without waiting for response (fire-and-forget).
+
+        The response will arrive via read_frame() as {'type': 'fail_resp'}.
+        """
+        buf = bytearray()
+        buf.extend(struct.pack("<H", len(jobs)))
+
+        for job in jobs:
+            _append_len_prefixed(buf, job.job_id.encode())
+            _append_len_prefixed(buf, job.queue.encode())
+            _append_len_prefixed(buf, job.error.encode())
+            _append_len_prefixed(buf, job.backtrace.encode())
+
+        self._send_only(MSG_FAIL_BATCH, bytes(buf))
+
+    def cancel(self, job_ids: list[str]) -> int:
+        """Cancel jobs by ID. Returns the number of jobs cancelled.
+
+        Sends MSG_BULK_ACTION with cancel action (request-response).
+        """
+        buf = bytearray()
+        # [action:u8][queue:lenPrefixed][count:u16][{id:lenPrefixed}...][flags:u8][now_ns:u64]
+        buf.append(3)  # BulkAction.cancel = 3
+        _append_len_prefixed(buf, b"")  # queue (empty)
+        buf.extend(struct.pack("<H", len(job_ids)))
+        for jid in job_ids:
+            _append_len_prefixed(buf, jid.encode())
+        buf.append(0)  # flags
+        buf.extend(struct.pack("<Q", 0))  # now_ns (server uses its own clock)
+
+        resp = self._send_recv(MSG_BULK_ACTION, MSG_BULK_ACTION_RESP, bytes(buf))
+        if len(resp) >= 2:
+            return struct.unpack_from("<H", resp)[0]
+        return 0
 
     # -- Internal --------------------------------------------------------------
 

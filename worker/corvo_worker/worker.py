@@ -27,10 +27,14 @@ class JobContext:
     def __init__(self, worker: "CorvoWorker", job_id: str) -> None:
         self._worker = worker
         self._job_id = job_id
+        self.cancelled = threading.Event()
+        """Event that is set when the server cancels this job.
+        Use cancelled.wait(timeout) to block until cancelled or timeout,
+        or cancelled.is_set() to poll. Pass to any API that can accept
+        a threading.Event to stop work immediately."""
 
     def is_cancelled(self) -> bool:
-        with self._worker._mu:
-            return self._worker._active.get(self._job_id, {}).get("cancelled", False)
+        return self.cancelled.is_set()
 
     def checkpoint(self, data: Dict[str, Any]) -> None:
         self._worker.client.heartbeat({self._job_id: {"checkpoint": data}})
@@ -117,10 +121,9 @@ class CorvoWorker:
                         ack_buffer.append({"job_id": job_id})
                         continue
 
-                    with self._mu:
-                        self._active[job_id] = {"cancelled": False}
-
                     ctx = JobContext(self, job_id)
+                    with self._mu:
+                        self._active[job_id] = ctx
                     try:
                         handler(job, ctx)
                         ack_buffer.append({"job_id": job_id})
@@ -161,7 +164,8 @@ class CorvoWorker:
                     for job_id, state in statuses.items():
                         if isinstance(state, dict) and state.get("status") == "cancel":
                             with self._mu:
-                                if job_id in self._active:
-                                    self._active[job_id]["cancelled"] = True
+                                ctx = self._active.get(job_id)
+                                if ctx is not None:
+                                    ctx.cancelled.set()
             except Exception:
                 pass
