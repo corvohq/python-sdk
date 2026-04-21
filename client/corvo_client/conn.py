@@ -91,6 +91,7 @@ class AckJob:
     result: str = ""
     checkpoint: str = ""
     hold_reason: str = ""
+    lease_token: int = 0
 
 
 @dataclass
@@ -99,6 +100,7 @@ class FailJob:
     queue: str
     error: str
     backtrace: str = ""
+    lease_token: int = 0
 
 
 @dataclass
@@ -306,7 +308,7 @@ class Conn:
 
         Blocks until the server sends a MSG_FETCH_BATCH_RESP frame.
         Returns a list of dicts with keys: id, queue, attempt, max_retries,
-        checkpoint, tags, payload.
+        checkpoint, tags, payload, lease_token.
 
         Raises RpcError on server error or unexpected message type.
         """
@@ -357,6 +359,8 @@ class Conn:
                 flags |= 0x02
             if ack.hold_reason:
                 flags |= 0x04
+            if ack.lease_token:
+                flags |= 0x08
             buf.append(flags)
 
             if flags & 0x01:
@@ -365,6 +369,8 @@ class Conn:
                 _append_len_prefixed(buf, ack.checkpoint.encode())
             if flags & 0x04:
                 _append_len_prefixed(buf, ack.hold_reason.encode())
+            if flags & 0x08:
+                buf.extend(struct.pack("<Q", ack.lease_token))
 
         resp = self._send_recv(MSG_ACK_BATCH, MSG_ACK_BATCH_RESP, bytes(buf))
 
@@ -380,12 +386,20 @@ class Conn:
         # [count:u16]
         buf.extend(struct.pack("<H", len(jobs)))
 
-        # per job: [id:lenPrefixed][queue:lenPrefixed][error:lenPrefixed][backtrace:lenPrefixed]
+        # per job: [id:lenPrefixed][queue:lenPrefixed][error:lenPrefixed][backtrace:lenPrefixed][flags:u8][if flag 0x01: lease_token:u64LE]
         for job in jobs:
             _append_len_prefixed(buf, job.job_id.encode())
             _append_len_prefixed(buf, job.queue.encode())
             _append_len_prefixed(buf, job.error.encode())
             _append_len_prefixed(buf, job.backtrace.encode())
+
+            flags = 0
+            if job.lease_token:
+                flags |= 0x01
+            buf.append(flags)
+
+            if flags & 0x01:
+                buf.extend(struct.pack("<Q", job.lease_token))
 
         resp = self._send_recv(MSG_FAIL_BATCH, MSG_FAIL_BATCH_RESP, bytes(buf))
 
@@ -507,6 +521,8 @@ class Conn:
                 flags |= 0x02
             if ack.hold_reason:
                 flags |= 0x04
+            if ack.lease_token:
+                flags |= 0x08
             buf.append(flags)
 
             if flags & 0x01:
@@ -515,6 +531,8 @@ class Conn:
                 _append_len_prefixed(buf, ack.checkpoint.encode())
             if flags & 0x04:
                 _append_len_prefixed(buf, ack.hold_reason.encode())
+            if flags & 0x08:
+                buf.extend(struct.pack("<Q", ack.lease_token))
 
         self._send_only(MSG_ACK_BATCH, bytes(buf))
 
@@ -531,6 +549,14 @@ class Conn:
             _append_len_prefixed(buf, job.queue.encode())
             _append_len_prefixed(buf, job.error.encode())
             _append_len_prefixed(buf, job.backtrace.encode())
+
+            flags = 0
+            if job.lease_token:
+                flags |= 0x01
+            buf.append(flags)
+
+            if flags & 0x01:
+                buf.extend(struct.pack("<Q", job.lease_token))
 
         self._send_only(MSG_FAIL_BATCH, bytes(buf))
 
@@ -700,6 +726,7 @@ class Conn:
                 [attempt:u16][max_retries:u16]
                 [checkpoint:lenPrefixed][tags:lenPrefixed]
                 [payload_len:u16][payload_bytes]
+                [lease_token:u64LE]
         """
         if len(resp) < 2:
             return []
@@ -723,6 +750,9 @@ class Conn:
             payload = bytes(resp[pos:pos + payload_len])
             pos += payload_len
 
+            lease_token = struct.unpack_from("<Q", resp, pos)[0]
+            pos += 8
+
             jobs.append({
                 "id": job_id.decode(),
                 "queue": queue.decode(),
@@ -731,6 +761,7 @@ class Conn:
                 "checkpoint": checkpoint.decode() if checkpoint else "",
                 "tags": tags.decode() if tags else "",
                 "payload": payload,
+                "lease_token": lease_token,
             })
 
         return jobs
