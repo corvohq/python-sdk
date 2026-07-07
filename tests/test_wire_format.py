@@ -15,11 +15,15 @@ from corvo_client.conn import (
     Conn,
     AckJob,
     FailJob,
+    RpcError,
+    ConnectionError_,
     _append_len_prefixed,
     _read_len_prefixed,
     FRAME_HEADER_FMT,
     FRAME_HEADER_SIZE,
     MSG_ACK_BATCH,
+    MSG_AUTH,
+    MSG_AUTH_RESP,
     MSG_FAIL_BATCH,
 )
 
@@ -584,3 +588,123 @@ class TestBackwardCompat:
 
         flags = payload[pos]
         assert flags == 0x01, f"expected flags=0x01 (result only), got 0x{flags:02x}"
+
+
+# ---------------------------------------------------------------------------
+# 5. Connection auth handshake (MSG_AUTH / MSG_AUTH_RESP)
+# ---------------------------------------------------------------------------
+
+class _FakeSocket:
+    """A socket stand-in that captures sent bytes and serves a scripted reply."""
+
+    def __init__(self, reply: bytes = b"") -> None:
+        self.sent = bytearray()
+        self._reply = bytes(reply)
+        self._pos = 0
+        self.closed = False
+
+    def setsockopt(self, *args) -> None:
+        pass
+
+    def connect(self, addr) -> None:
+        pass
+
+    def sendall(self, data: bytes) -> None:
+        self.sent.extend(data)
+
+    def recv(self, n: int) -> bytes:
+        chunk = self._reply[self._pos:self._pos + n]
+        self._pos += len(chunk)
+        return chunk
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _auth_resp_frame(status: int, role: int = 0, msg_type: int = MSG_AUTH_RESP) -> bytes:
+    """Build a full MSG_AUTH_RESP frame: header + [status:u8][role:u8]."""
+    payload = bytes([status, role])
+    return struct.pack(FRAME_HEADER_FMT, msg_type, 1, len(payload)) + payload
+
+
+class TestAuthHandshake:
+    """Test the MSG_AUTH connection handshake without a live server."""
+
+    def test_handshake_sends_len_prefixed_token(self):
+        """_authenticate sends a MSG_AUTH frame with a length-prefixed token."""
+        conn = Conn("127.0.0.1", 9999, auth_token="s3cret")
+        sock = _FakeSocket(reply=_auth_resp_frame(0))
+
+        conn._authenticate(sock)
+
+        # Frame header: [msg_type:u8][req_id:u32][payload_len:u32]
+        msg_type, req_id, payload_len = struct.unpack_from(FRAME_HEADER_FMT, sock.sent, 0)
+        assert msg_type == MSG_AUTH
+        payload = bytes(sock.sent[FRAME_HEADER_SIZE:FRAME_HEADER_SIZE + payload_len])
+        # Payload: [token_len:u8][token bytes]
+        assert payload[0] == len(b"s3cret")
+        assert payload[1:] == b"s3cret"
+
+    def test_handshake_success_status_zero(self):
+        """status=0 completes the handshake without error."""
+        conn = Conn("127.0.0.1", 9999, auth_token="pw")
+        sock = _FakeSocket(reply=_auth_resp_frame(0, role=1))
+        conn._authenticate(sock)  # should not raise
+
+    def test_handshake_failure_nonzero_status(self):
+        """A non-zero status raises RpcError (credentials rejected)."""
+        conn = Conn("127.0.0.1", 9999, auth_token="wrong")
+        sock = _FakeSocket(reply=_auth_resp_frame(1))
+        with pytest.raises(RpcError):
+            conn._authenticate(sock)
+
+    def test_handshake_unexpected_response_type(self):
+        """An unexpected response message type raises ConnectionError_."""
+        conn = Conn("127.0.0.1", 9999, auth_token="pw")
+        # Reply with the wrong message type (e.g. MSG_ERROR 0xFF).
+        sock = _FakeSocket(reply=_auth_resp_frame(0, msg_type=0xFF))
+        with pytest.raises(ConnectionError_):
+            conn._authenticate(sock)
+
+    def test_token_truncated_to_255_bytes(self):
+        """Tokens longer than 255 bytes are truncated to fit the u8 length prefix."""
+        long_token = "x" * 300
+        conn = Conn("127.0.0.1", 9999, auth_token=long_token)
+        sock = _FakeSocket(reply=_auth_resp_frame(0))
+        conn._authenticate(sock)
+
+        _, _, payload_len = struct.unpack_from(FRAME_HEADER_FMT, sock.sent, 0)
+        payload = bytes(sock.sent[FRAME_HEADER_SIZE:FRAME_HEADER_SIZE + payload_len])
+        assert payload[0] == 255
+        assert payload[1:] == b"x" * 255
+
+    def test_connect_skips_handshake_without_token(self):
+        """_connect performs no MSG_AUTH when no token is configured."""
+        conn = Conn("127.0.0.1", 9999)  # no auth_token
+        fake = _FakeSocket()
+
+        with patch("socket.socket", return_value=fake):
+            with patch.object(Conn, "_authenticate") as mock_auth:
+                conn._connect()
+                mock_auth.assert_not_called()
+        assert len(fake.sent) == 0
+
+    def test_connect_runs_handshake_with_token(self):
+        """_connect performs the MSG_AUTH handshake when a token is configured."""
+        conn = Conn("127.0.0.1", 9999, auth_token="pw")
+        fake = _FakeSocket()
+
+        with patch("socket.socket", return_value=fake):
+            with patch.object(Conn, "_authenticate") as mock_auth:
+                conn._connect()
+                mock_auth.assert_called_once()
+
+    def test_connect_closes_socket_on_auth_failure(self):
+        """A failed handshake during _connect closes the socket and propagates."""
+        conn = Conn("127.0.0.1", 9999, auth_token="wrong")
+        fake = _FakeSocket(reply=_auth_resp_frame(1))  # status != 0
+
+        with patch("socket.socket", return_value=fake):
+            with pytest.raises(RpcError):
+                conn._connect()
+        assert fake.closed, "socket must be closed when the handshake fails"

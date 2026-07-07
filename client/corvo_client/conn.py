@@ -25,6 +25,7 @@ MSG_ENQUEUE_BATCH = 0x01
 MSG_FETCH_BATCH = 0x02
 MSG_ACK_BATCH = 0x03
 MSG_PING = 0x04
+MSG_AUTH = 0x05  # connection auth handshake (client -> server)
 MSG_HEARTBEAT = 0x06
 MSG_FAIL_BATCH = 0x07
 
@@ -33,6 +34,7 @@ MSG_ENQUEUE_BATCH_RESP = 0x81
 MSG_FETCH_BATCH_RESP = 0x82
 MSG_ACK_BATCH_RESP = 0x83
 MSG_PONG = 0x84
+MSG_AUTH_RESP = 0x85  # auth handshake result (server -> client)
 MSG_HEARTBEAT_RESP = 0x86
 MSG_FAIL_BATCH_RESP = 0x87
 MSG_ERROR = 0xFF
@@ -157,9 +159,14 @@ class Conn:
     Uses a single persistent TCP connection with TCP_NODELAY.
     Reconnects automatically on connection errors.
 
+    When ``auth_token`` is set (an API key or the admin password), the
+    connection performs the MSG_AUTH handshake immediately after each
+    (re)connect, before any other frame. This is required when the server is
+    started with an admin password; leave it empty otherwise.
+
     Example::
 
-        conn = Conn("127.0.0.1", 9878)
+        conn = Conn("127.0.0.1", 9878, auth_token="s3cret")
         conn.ping()
         n = conn.enqueue_batch([EnqueueJob(queue="emails", job_id="job-1")])
         conn.subscribe(["emails"], worker_id="w1", credits=10)
@@ -168,9 +175,10 @@ class Conn:
         conn.close()
     """
 
-    def __init__(self, host: str, port: int) -> None:
+    def __init__(self, host: str, port: int, auth_token: str = "") -> None:
         self._host = host
         self._port = port
+        self._auth_token = auth_token
         self._sock: Optional[socket.socket] = None
         self._req_id: int = 0
         self._recv_buf = bytearray(65536)
@@ -583,15 +591,61 @@ class Conn:
     # -- Internal --------------------------------------------------------------
 
     def _connect(self) -> socket.socket:
-        """Create a new TCP connection with TCP_NODELAY."""
+        """Create a new TCP connection with TCP_NODELAY.
+
+        If an auth token is configured, performs the MSG_AUTH handshake before
+        returning so every (re)connect is authenticated before any other frame.
+        On any failure the socket is closed and the error re-raised.
+        """
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             sock.connect((self._host, self._port))
-        except OSError:
+            # Authenticate before any other frame if a token is configured.
+            # Servers started with an admin password gate the connection until
+            # this succeeds; without a token the handshake is skipped entirely
+            # (backward compatible with unauthenticated servers).
+            if self._auth_token:
+                self._authenticate(sock)
+        except Exception:
             sock.close()
             raise
         return sock
+
+    def _authenticate(self, sock: socket.socket) -> None:
+        """Perform the MSG_AUTH handshake on a freshly-opened socket.
+
+        Wire: send MSG_AUTH with payload [token:lenPrefixed]; read
+        MSG_AUTH_RESP with payload [status:u8 (0=ok)][role:u8].
+
+        Raises RpcError if the server rejects the credentials (status != 0),
+        or ConnectionError_ on an unexpected response type.
+        """
+        token = self._auth_token.encode()
+        if len(token) > 255:
+            token = token[:255]
+
+        # Payload: [token_len:u8][token bytes]
+        payload = bytearray()
+        payload.append(len(token))
+        payload.extend(token)
+
+        self._req_id = (self._req_id + 1) & 0xFFFFFFFF
+        header = struct.pack(FRAME_HEADER_FMT, MSG_AUTH, self._req_id, len(payload))
+        sock.sendall(header + bytes(payload))
+
+        # Read the response frame: header + payload.
+        resp_hdr = self._recv_exact(sock, FRAME_HEADER_SIZE)
+        resp_type, _resp_id, resp_len = struct.unpack(FRAME_HEADER_FMT, resp_hdr)
+        resp_payload = self._recv_exact(sock, resp_len) if resp_len > 0 else b""
+
+        if resp_type != MSG_AUTH_RESP:
+            raise ConnectionError_(
+                f"unexpected auth response type: 0x{resp_type:02x}, "
+                f"expected MSG_AUTH_RESP (0x{MSG_AUTH_RESP:02x})"
+            )
+        if len(resp_payload) < 1 or resp_payload[0] != 0:
+            raise RpcError("authentication failed")
 
     def _ensure_connected(self) -> socket.socket:
         """Return the current socket, reconnecting if needed."""
