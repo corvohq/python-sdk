@@ -40,6 +40,7 @@ MSG_FAIL_BATCH_RESP = 0x87
 MSG_ERROR = 0xFF
 
 MSG_CANCEL_SIGNAL = 0x08  # server -> client push
+MSG_NOT_LEADER = 0x09  # server -> client push: this node is no longer the leader
 
 # Bulk action request/response
 MSG_BULK_ACTION = 0x14
@@ -115,6 +116,17 @@ class HeartbeatJob:
 
 class RpcError(Exception):
     """Raised when the server returns an error frame."""
+    pass
+
+
+class RetryableError(RpcError):
+    """Raised when a subscribe should be retried after a brief backoff.
+
+    Signals a transient condition rather than a permanent failure: the server
+    rejected the subscribe because it is at connection capacity, or the cluster
+    leader stepped down after we subscribed. Callers should back off briefly
+    and re-subscribe rather than failing the worker.
+    """
     pass
 
 
@@ -318,7 +330,10 @@ class Conn:
         Returns a list of dicts with keys: id, queue, attempt, max_retries,
         checkpoint, tags, payload, lease_token.
 
-        Raises RpcError on server error or unexpected message type.
+        Raises RetryableError when the subscribe is transiently rejected (the
+        server is at connection capacity, or the leader stepped down) — callers
+        should back off briefly and re-subscribe. Raises RpcError on any other
+        server error or unexpected message type.
         """
         sock = self._ensure_connected()
 
@@ -336,8 +351,17 @@ class Conn:
             resp_payload = memoryview(self._recv_buf)[:0]
 
         if resp_type == MSG_ERROR:
+            # A MSG_ERROR in reply to a subscribe means the server is at
+            # connection capacity — transient. Back off and re-subscribe on the
+            # same connection instead of failing the worker.
             err_msg = bytes(resp_payload).decode("utf-8", errors="replace")
-            raise RpcError(f"server error: {err_msg}")
+            raise RetryableError(f"subscribe rejected: {err_msg}")
+
+        if resp_type == MSG_NOT_LEADER:
+            # The leader stepped down after we subscribed. Drop the connection
+            # so the next subscribe reconnects, then signal a retry.
+            self._drop_connection()
+            raise RetryableError("leader stepped down; reconnect and re-subscribe")
 
         if resp_type != MSG_FETCH_BATCH_RESP:
             raise RpcError(
@@ -463,8 +487,13 @@ class Conn:
           {'type': 'ack_resp', 'affected': int}
           {'type': 'fail_resp', 'affected': int}
           {'type': 'cancel_signal', 'job_ids': [...]}
+          {'type': 'not_leader'}
           {'type': 'pong'}
           {'type': 'error', 'message': str}
+
+        A 'not_leader' frame means the leader stepped down; drop the connection
+        and re-subscribe. An 'error' frame in reply to a subscribe is transient
+        (server at capacity) — back off briefly and re-subscribe.
         """
         sock = self._ensure_connected()
 
@@ -499,6 +528,9 @@ class Conn:
                     jid, pos = _read_len_prefixed(resp_payload, pos)
                     job_ids.append(jid.decode())
             return {"type": "cancel_signal", "job_ids": job_ids}
+
+        if resp_type == MSG_NOT_LEADER:
+            return {"type": "not_leader"}
 
         if resp_type == MSG_PONG:
             return {"type": "pong"}
@@ -779,8 +811,12 @@ class Conn:
                 [id:lenPrefixed][queue:lenPrefixed]
                 [attempt:u16][max_retries:u16]
                 [checkpoint:lenPrefixed][tags:lenPrefixed]
-                [payload_len:u16][payload_bytes]
+                [payload_len:u32LE][payload_bytes]
                 [lease_token:u64LE]
+
+        payload_len is a u32: the server's default max_payload_size is 65536
+        and its hard cap (rpc.MAX_PAYLOAD_SIZE) is 256 KiB, both of which exceed
+        u16's 65535 limit, so a u16 length field could not carry a legal payload.
         """
         if len(resp) < 2:
             return []
@@ -799,8 +835,8 @@ class Conn:
             checkpoint, pos = _read_len_prefixed(resp, pos)
             tags, pos = _read_len_prefixed(resp, pos)
 
-            payload_len = struct.unpack_from("<H", resp, pos)[0]
-            pos += 2
+            payload_len = struct.unpack_from("<I", resp, pos)[0]
+            pos += 4
             payload = bytes(resp[pos:pos + payload_len])
             pos += payload_len
 

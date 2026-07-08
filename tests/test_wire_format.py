@@ -6,6 +6,7 @@ WITHOUT requiring a running Corvo server.
 Run with: .venv/bin/pytest tests/test_wire_format.py -v
 """
 
+import socket
 import struct
 from unittest.mock import patch, MagicMock
 
@@ -16,6 +17,7 @@ from corvo_client.conn import (
     AckJob,
     FailJob,
     RpcError,
+    RetryableError,
     ConnectionError_,
     _append_len_prefixed,
     _read_len_prefixed,
@@ -24,7 +26,9 @@ from corvo_client.conn import (
     MSG_ACK_BATCH,
     MSG_AUTH,
     MSG_AUTH_RESP,
+    MSG_ERROR,
     MSG_FAIL_BATCH,
+    MSG_NOT_LEADER,
 )
 
 
@@ -58,9 +62,9 @@ def _build_fetch_response_payload(jobs: list[dict]) -> bytes:
         buf.extend(_build_len_prefixed(job.get("checkpoint", "").encode()))
         buf.extend(_build_len_prefixed(job.get("tags", "").encode()))
 
-        # [payload_len:u16][payload_bytes]
+        # [payload_len:u32][payload_bytes]
         payload = job.get("payload", b"")
-        buf.extend(struct.pack("<H", len(payload)))
+        buf.extend(struct.pack("<I", len(payload)))
         buf.extend(payload)
 
         # [lease_token:u64LE]
@@ -296,6 +300,60 @@ class TestFetchResponseParsing:
         # The last 8 bytes of the buffer should be the lease_token in LE
         expected_token_bytes = struct.pack("<Q", token)
         assert raw[-8:] == expected_token_bytes
+
+    def test_payload_exactly_65536_bytes(self):
+        """A 64 KiB payload round-trips (impossible under the old u16 length).
+
+        65536 is the server's default max_payload_size and one past u16's 65535
+        cap, so this only decodes with the widened u32 payload-length field.
+        """
+        payload = b"\xa5" * 65536
+        raw = _build_fetch_response_payload([{
+            "id": "big-job",
+            "queue": "q",
+            "attempt": 1,
+            "max_retries": 3,
+            "checkpoint": "",
+            "tags": "",
+            "payload": payload,
+            "lease_token": 0xCAFEF00D,
+        }])
+
+        conn = Conn.__new__(Conn)
+        jobs = conn._decode_fetch_response(memoryview(bytearray(raw)))
+
+        assert len(jobs) == 1
+        assert len(jobs[0]["payload"]) == 65536
+        assert jobs[0]["payload"] == payload
+        assert jobs[0]["lease_token"] == 0xCAFEF00D
+
+    def test_payload_larger_than_u16_with_trailing_job(self):
+        """A >64 KiB payload followed by another job decodes both correctly.
+
+        Proves the u32 length advances the cursor by the right amount so the
+        next job's fields are not misread.
+        """
+        big = b"z" * 70000
+        raw = _build_fetch_response_payload([
+            {
+                "id": "j1", "queue": "q", "attempt": 1, "max_retries": 3,
+                "checkpoint": "", "tags": "", "payload": big, "lease_token": 11,
+            },
+            {
+                "id": "j2", "queue": "q", "attempt": 2, "max_retries": 3,
+                "checkpoint": "", "tags": "", "payload": b"small", "lease_token": 22,
+            },
+        ])
+
+        conn = Conn.__new__(Conn)
+        jobs = conn._decode_fetch_response(memoryview(bytearray(raw)))
+
+        assert len(jobs) == 2
+        assert jobs[0]["payload"] == big
+        assert jobs[0]["lease_token"] == 11
+        assert jobs[1]["id"] == "j2"
+        assert jobs[1]["payload"] == b"small"
+        assert jobs[1]["lease_token"] == 22
 
 
 # ---------------------------------------------------------------------------
@@ -708,3 +766,65 @@ class TestAuthHandshake:
             with pytest.raises(RpcError):
                 conn._connect()
         assert fake.closed, "socket must be closed when the handshake fails"
+
+
+# ---------------------------------------------------------------------------
+# 6. Subscribe retry semantics -- MSG_ERROR / MSG_NOT_LEADER on a subscription
+# ---------------------------------------------------------------------------
+
+def _conn_serving(frame: bytes) -> Conn:
+    """Return a Conn whose socket will serve exactly *frame* bytes then EOF.
+
+    Uses a real socketpair so recv/recv_into behave like a live connection.
+    """
+    server, client = socket.socketpair()
+    server.sendall(frame)
+    server.close()  # EOF once the frame is drained
+    conn = Conn("127.0.0.1", 0)
+    conn._sock = client
+    return conn
+
+
+class TestSubscribeRetry:
+    """The subscribe read path must treat capacity/leader frames as retryable."""
+
+    def test_read_pushed_jobs_error_is_retryable(self):
+        """A MSG_ERROR reply to a subscribe raises RetryableError, not a fatal error."""
+        msg = b"subscription rejected: server at connection capacity"
+        frame = struct.pack(FRAME_HEADER_FMT, MSG_ERROR, 7, len(msg)) + msg
+        conn = _conn_serving(frame)
+
+        with pytest.raises(RetryableError):
+            conn.read_pushed_jobs()
+
+    def test_read_pushed_jobs_not_leader_is_retryable_and_drops_conn(self):
+        """A MSG_NOT_LEADER push raises RetryableError and drops the socket."""
+        frame = struct.pack(FRAME_HEADER_FMT, MSG_NOT_LEADER, 7, 0)
+        conn = _conn_serving(frame)
+
+        with pytest.raises(RetryableError):
+            conn.read_pushed_jobs()
+        # Dropped so the next subscribe() reconnects.
+        assert conn._sock is None
+
+    def test_retryable_error_is_subclass_of_rpc_error(self):
+        """RetryableError is catchable as RpcError for backward compatibility."""
+        assert issubclass(RetryableError, RpcError)
+
+    def test_read_frame_not_leader_does_not_crash(self):
+        """read_frame dispatches MSG_NOT_LEADER as a typed dict, never raising."""
+        frame = struct.pack(FRAME_HEADER_FMT, MSG_NOT_LEADER, 7, 0)
+        conn = _conn_serving(frame)
+
+        result = conn.read_frame()
+        assert result == {"type": "not_leader"}
+
+    def test_read_frame_error_is_returned_not_raised(self):
+        """read_frame returns an 'error' dict for MSG_ERROR without raising."""
+        msg = b"subscription rejected: server at connection capacity"
+        frame = struct.pack(FRAME_HEADER_FMT, MSG_ERROR, 7, len(msg)) + msg
+        conn = _conn_serving(frame)
+
+        result = conn.read_frame()
+        assert result["type"] == "error"
+        assert result["message"] == msg.decode()
